@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+faiss-cpu
+aiohttp
+torch
+transformers
+datasets
+accelerate
+bitsandbytes
+lfs
+pillow
+peft
+soundfile
+qwen_tts
