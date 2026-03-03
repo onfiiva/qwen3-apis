@@ -4,13 +4,14 @@ import io
 from PIL import Image
 from typing import List, Optional, Dict, Any
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 
 
 class QwenInferenceService:
     def __init__(self, model_path: str):
         self.model_path = model_path
-        self.model = None
+        self.base_model = None
+        self.lora_model = None
         self.processor = None
         if torch.backends.mps.is_available():
             self.device = torch.device("mps")
@@ -21,36 +22,47 @@ class QwenInferenceService:
         print(f"Loading model on device: {self.device}")
         self.processor = AutoProcessor.from_pretrained(
             self.model_path,
-            local_files_only=True  # <- local
+            local_files_only=True
         )
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+
+        self.base_model = Qwen3VLForConditionalGeneration.from_pretrained(
             self.model_path,
-            torch_dtype=torch.float16 if self.device.type == "mps" else torch.float32,
+            dtype=torch.float16 if self.device.type == "mps" else torch.float32,
             device_map={"": self.device} if self.device.type == "mps" else None
         )
+
+        self.base_model.eval()
         print("Model loaded successfully")
 
     def enable_lora(self):
         lora_config = LoraConfig(
             r=8,
             lora_alpha=16,
-            target_modules=[
-                "q_proj",
-                "v_proj"
-            ],
+            target_modules=["q_proj", "v_proj"],
             lora_dropout=0.1,
             bias="none",
             task_type="CAUSAL_LM"
         )
-        self.model = get_peft_model(self.model, lora_config)
-        self.model.print_trainable_parameters()
+
+        self.lora_model = get_peft_model(self.base_model, lora_config)
+        self.lora_model.print_trainable_parameters()
+
+    def load_lora(self, lora_path: str):
+        self.lora_model = PeftModel.from_pretrained(
+            self.base_model,
+            lora_path
+        )
+        self.lora_model.eval()
 
     def train_lora(self, dataset, epochs=1, lr=2e-4, batch_size=1):
-        """
-        dataset: torch Dataset, который отдаёт input_ids, attention_mask, labels
-        """
-        self.model.train()
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
+
+        if self.lora_model is None:
+            raise RuntimeError("LoRA not enabled")
+
+        model = self.lora_model
+        model.train()
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
         from torch.utils.data import DataLoader
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -62,10 +74,10 @@ class QwenInferenceService:
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                outputs = self.model(
-                    input_ids=input_ids.unsqueeze(0),
-                    attention_mask=attention_mask.unsqueeze(0),
-                    labels=labels.unsqueeze(0)
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
                 )
 
                 loss = outputs.loss
@@ -74,8 +86,9 @@ class QwenInferenceService:
                 optimizer.zero_grad()
                 total_loss += loss.item()
 
-            print(f"[LoRA Train] Epoch {epoch+1}/{epochs},"
-                  f"Loss: {total_loss/len(dataloader):.4f}")
+            print(f"[LoRA Train] Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader):.4f}")
+
+        model.eval()
 
     def _decode_image(self, image_b64: str) -> Image.Image:
         image_bytes = base64.b64decode(image_b64)
@@ -114,8 +127,14 @@ class QwenInferenceService:
         prompt: str,
         instructions: Optional[List[str]] = None,
         image_b64: Optional[str] = None,
-        gen_config: Optional[Dict[str, Any]] = None
+        gen_config: Optional[Dict[str, Any]] = None,
+        mode="base"
     ):
+        if mode == "lora" and self.lora_model:
+            model = self.lora_model
+        else:
+            model = self.base_model
+
         gen_config = gen_config or {
             "max_new_tokens": 256,
             "temperature": 0.2,
@@ -133,7 +152,7 @@ class QwenInferenceService:
         ).to(self.device)
 
         with torch.no_grad():
-            generated_ids = self.model.generate(
+            generated_ids = model.generate(
                 **inputs,
                 **gen_config
             )

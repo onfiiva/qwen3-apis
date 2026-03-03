@@ -2,4 +2,5 @@
 models/*
 venv/
 .env
-voices/
+voices/*
+lora_weights/*

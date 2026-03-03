@@ -12,3 +12,4 @@ pillow
 peft
 soundfile
 qwen_tts
+torchvision
